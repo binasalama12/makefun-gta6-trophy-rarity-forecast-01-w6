@@ -85,10 +85,30 @@ def round4(x):
     return int(value) if value == int(value) else value
 
 
+def valid_rate(value):
+    """Coerce a raw rate cell to a finite float, else None.
+
+    Guards against damaged reads: bools, strings, NaN and infinities
+    are treated as missing rather than poisoning the fit.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    rate = float(value)
+    return rate if math.isfinite(rate) else None
+
+
+def rate_at(read, index):
+    """Rate for trophy `index` in one read, tolerating short/missing lists."""
+    rates = read.get("rates") or []
+    if index >= len(rates):
+        return None
+    return valid_rate(rates[index])
+
+
 def last_known_rate(history, index):
-    """Most recent non-null rate for trophy `index`, else None."""
+    """Most recent usable rate for trophy `index`, else None."""
     for read in reversed(history):
-        rate = read["rates"][index]
+        rate = rate_at(read, index)
         if rate is not None:
             return rate
     return None
@@ -96,8 +116,12 @@ def last_known_rate(history, index):
 
 def forecast_trophy(case, index):
     """Return (median_percent, spread_logit) for one trophy."""
-    history = case["history"]
-    horizon_days = case["horizon_minutes"] / 1440.0
+    history = case.get("history") or []
+    horizon = valid_rate(case.get("horizon_minutes"))
+    horizon_days = max(0.0, horizon) / 1440.0 if horizon is not None else 0.0
+    if not history:
+        # No reads at all: centre wide and admit we know nothing.
+        return 50.0, FLAT_SPREAD
     last_rate = last_known_rate(history, index)
     if last_rate is None:
         # Trophy never observed: centre wide and admit we know nothing.
@@ -109,7 +133,7 @@ def forecast_trophy(case, index):
     t_last = times[-1]
     points = []
     for read, when in zip(history, times):
-        rate = read["rates"][index]
+        rate = rate_at(read, index)
         if rate is None:
             continue
         if (t_last - when).total_seconds() > WINDOW_HOURS * 3600.0:
@@ -167,13 +191,16 @@ def flat_branch(last_rate):
 
 
 def forecast_case(case, name):
-    if case["levels"] != LEVELS:
-        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
-    if not case["history"]:
-        raise ValueError(f"{name} has no history")
+    levels = case.get("levels")
+    if levels is not None and list(levels) != LEVELS:
+        raise ValueError(f"{name} asks for levels {levels}, not {LEVELS}")
     rows = []
-    for index, trophy in enumerate(case["trophies"]):
+    for index, trophy in enumerate(case.get("trophies") or []):
         median, spread = forecast_trophy(case, index)
+        if valid_rate(median) is None:
+            median = 50.0
+        if valid_rate(spread) is None or spread < 0.0:
+            spread = FLAT_SPREAD
         centre = logit(median)
         quantiles = []
         previous = None
@@ -183,7 +210,18 @@ def forecast_case(case, name):
                 q = previous
             quantiles.append(q)
             previous = q
-        rows.append({"id": trophy["id"], "q": quantiles})
+        # Final guarantee pass: finite, inside [0, 100], non-decreasing,
+        # whatever the branches above produced.
+        cleaned = []
+        for q in quantiles:
+            if valid_rate(q) is None:
+                q = 0
+            q = min(100, max(0, q))
+            if cleaned and q < cleaned[-1]:
+                q = cleaned[-1]
+            cleaned.append(q)
+        quantiles = cleaned
+        rows.append({"id": trophy.get("id"), "q": quantiles})
     return {"trophies": rows}
 
 
